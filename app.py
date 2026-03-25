@@ -1,16 +1,169 @@
+import io
+import json
 from pathlib import Path
 import pickle
+import re
 import time
 
 import streamlit as st
 
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 
 BASE_DIR = Path(__file__).resolve().parent
+GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY_HERE"
+GEMINI_VISION_MODEL = "gemini-1.5-flash"
+
+SESSION_DEFAULTS = {
+    "diabetes_pregnancies": 0,
+    "diabetes_bmi": 25.0,
+    "diabetes_glucose": 100,
+    "diabetes_age": 30,
+    "diabetes_bp": 80,
+    "heart_age": 45,
+    "heart_rate": 150,
+    "cholesterol": 200,
+    "oldpeak": 1.0,
+    "liver_age": 35,
+    "direct_bilirubin": 0.5,
+    "total_bilirubin": 1.0,
+    "albumin": 3.0,
+}
+
+REPORT_LABELS = {
+    "glucose": "Glucose",
+    "blood_pressure": "Blood Pressure",
+    "age": "Age",
+    "bmi": "BMI",
+    "pregnancies": "Pregnancies",
+    "heart_rate": "Heart Rate",
+    "cholesterol": "Cholesterol",
+}
 
 
 def load_model(model_name):
     with (BASE_DIR / model_name).open("rb") as model_file:
         return pickle.load(model_file)
+
+
+def init_session_state():
+    for key, value in SESSION_DEFAULTS.items():
+        st.session_state.setdefault(key, value)
+
+    st.session_state.setdefault("extracted_report_values", {})
+
+
+def extract_json_from_text(raw_text):
+    cleaned_text = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    match = re.search(r"\{.*\}", cleaned_text, re.DOTALL)
+    if not match:
+        raise ValueError("Gemini did not return valid JSON.")
+
+    return json.loads(match.group(0))
+
+
+def coerce_number(value, integer=False, default=None):
+    if value is None:
+        return default
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        text_value = str(value).strip()
+        if not text_value or text_value.lower() in {"none", "null", "n/a", "na", "not available"}:
+            return default
+
+        match = re.search(r"-?\d+(?:\.\d+)?", text_value.replace(",", ""))
+        if not match:
+            return default
+
+        number = float(match.group(0))
+
+    if integer:
+        return int(round(number))
+
+    return float(number)
+
+
+def normalize_report_values(payload):
+    return {
+        "glucose": coerce_number(payload.get("glucose"), integer=True),
+        "blood_pressure": coerce_number(payload.get("blood_pressure"), integer=True),
+        "age": coerce_number(payload.get("age"), integer=True),
+        "bmi": coerce_number(payload.get("bmi")),
+        "pregnancies": coerce_number(payload.get("pregnancies"), integer=True, default=0),
+        "heart_rate": coerce_number(payload.get("heart_rate"), integer=True),
+        "cholesterol": coerce_number(payload.get("cholesterol"), integer=True),
+    }
+
+
+def extract_report_values(image_bytes):
+    if genai is None or Image is None:
+        raise RuntimeError("Install google-generativeai and pillow to use report upload.")
+
+    if GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
+        raise RuntimeError("Add your GOOGLE_API_KEY in the GOOGLE_API_KEY placeholder first.")
+
+    genai.configure(api_key=GOOGLE_API_KEY)
+    model = genai.GenerativeModel(GEMINI_VISION_MODEL)
+    image = Image.open(io.BytesIO(image_bytes))
+
+    prompt = """
+    You are reading a blood test or medical report image.
+    Extract only these values and return strict JSON:
+    {
+      "glucose": number or null,
+      "blood_pressure": number or null,
+      "age": number or null,
+      "bmi": number or null,
+      "pregnancies": number,
+      "heart_rate": number or null,
+      "cholesterol": number or null
+    }
+
+    Rules:
+    - Use only numeric values, no units.
+    - If blood pressure is written like 120/80, return the systolic value as blood_pressure.
+    - If pregnancies is missing, use 0.
+    - If any other value is missing, use null.
+    - Do not add any extra keys or explanation.
+    """
+
+    response = model.generate_content(
+        [prompt, image],
+        generation_config={"temperature": 0},
+    )
+
+    raw_text = getattr(response, "text", "") or ""
+    return normalize_report_values(extract_json_from_text(raw_text))
+
+
+def apply_extracted_values(values):
+    value_map = {
+        "glucose": ["diabetes_glucose"],
+        "blood_pressure": ["diabetes_bp"],
+        "age": ["diabetes_age", "heart_age", "liver_age"],
+        "bmi": ["diabetes_bmi"],
+        "pregnancies": ["diabetes_pregnancies"],
+        "heart_rate": ["heart_rate"],
+        "cholesterol": ["cholesterol"],
+    }
+
+    for field_name, targets in value_map.items():
+        field_value = values.get(field_name)
+        if field_value is None:
+            continue
+
+        for target in targets:
+            st.session_state[target] = field_value
 
 
 st.set_page_config(
@@ -409,6 +562,8 @@ except FileNotFoundError:
     st.error("⚠️ System Error: Neural Models not found. Run 'python train_models.py' first.")
     st.stop()
 
+init_session_state()
+
 module_labels = {
     "Diabetes Detection": "🩸  Diabetes Detection",
     "Heart Health Scan": "❤️  Heart Health Scan",
@@ -480,6 +635,35 @@ with st.sidebar:
     st.markdown("---")
     st.info("💡 **ML Prediction Demo**\nInput-based health risk analysis.")
 
+    st.markdown("---")
+    st.subheader("Upload Report & Auto-Fill")
+    uploaded_report = st.file_uploader(
+        "Upload Blood Test Report",
+        type=["jpg", "jpeg", "png"],
+        key="report_uploader",
+    )
+
+    if st.button("Extract Values From Report", key="extract_report_values_button"):
+        if uploaded_report is None:
+            st.warning("Please upload a JPG or PNG blood test report first.")
+        else:
+            try:
+                with st.spinner("Reading report with Gemini Vision..."):
+                    extracted_values = extract_report_values(uploaded_report.getvalue())
+                st.session_state["extracted_report_values"] = extracted_values
+                st.success("Report values extracted successfully.")
+            except Exception as exc:
+                st.error(f"Unable to extract report values: {exc}")
+
+    extracted_values = st.session_state.get("extracted_report_values", {})
+    if extracted_values:
+        st.caption("Extracted values")
+        st.json({REPORT_LABELS[key]: value for key, value in extracted_values.items()})
+
+        if st.button("Auto-Fill Main Fields", key="autofill_report_values_button"):
+            apply_extracted_values(extracted_values)
+            st.rerun()
+
 st.markdown(
     f"""
     <div class="hero-panel">
@@ -496,13 +680,43 @@ if selected == "Diabetes Detection":
     with st.container(border=True):
         col1, col2, col3 = st.columns(3)
         with col1:
-            pregnancies = st.number_input("🤰 Pregnancies", 0, 20, 0)
-            bmi = st.number_input("⚖️ BMI Index", 0.0, 70.0, 25.0)
+            pregnancies = st.number_input(
+                "🤰 Pregnancies",
+                min_value=0,
+                max_value=20,
+                step=1,
+                key="diabetes_pregnancies",
+            )
+            bmi = st.number_input(
+                "⚖️ BMI Index",
+                min_value=0.0,
+                max_value=70.0,
+                step=0.1,
+                key="diabetes_bmi",
+            )
         with col2:
-            glucose = st.number_input("🍬 Glucose Level", 0, 300, 100)
-            age = st.number_input("📅 Age", 0, 120, 30)
+            glucose = st.number_input(
+                "🍬 Glucose Level",
+                min_value=0,
+                max_value=300,
+                step=1,
+                key="diabetes_glucose",
+            )
+            age = st.number_input(
+                "📅 Age",
+                min_value=0,
+                max_value=120,
+                step=1,
+                key="diabetes_age",
+            )
         with col3:
-            bp = st.number_input("💓 Blood Pressure", 0, 200, 80)
+            bp = st.number_input(
+                "💓 Blood Pressure",
+                min_value=0,
+                max_value=200,
+                step=1,
+                key="diabetes_bp",
+            )
 
         st.write("")
         if st.button("Analyze Report"):
@@ -522,11 +736,35 @@ if selected == "Heart Health Scan":
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
-            age = st.number_input("📅 Patient Age", 0, 120, 45)
-            heart_rate = st.number_input("💓 Max Heart Rate", 0, 250, 150)
+            age = st.number_input(
+                "📅 Patient Age",
+                min_value=0,
+                max_value=120,
+                step=1,
+                key="heart_age",
+            )
+            heart_rate = st.number_input(
+                "💓 Max Heart Rate",
+                min_value=0,
+                max_value=250,
+                step=1,
+                key="heart_rate",
+            )
         with col2:
-            chol = st.number_input("🩸 Cholesterol (mg/dl)", 100, 600, 200)
-            oldpeak = st.number_input("📉 ST Depression", 0.0, 10.0, 1.0)
+            chol = st.number_input(
+                "🩸 Cholesterol (mg/dl)",
+                min_value=0,
+                max_value=600,
+                step=1,
+                key="cholesterol",
+            )
+            oldpeak = st.number_input(
+                "📉 ST Depression",
+                min_value=0.0,
+                max_value=10.0,
+                step=0.1,
+                key="oldpeak",
+            )
 
         st.write("")
         if st.button("Run Cardiac Prediction"):
@@ -546,11 +784,35 @@ if selected == "Liver Function Test":
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
-            age = st.number_input("📅 Patient Age", 0, 120, 35)
-            direct_bilirubin = st.number_input("🧪 Direct Bilirubin", 0.0, 20.0, 0.5)
+            age = st.number_input(
+                "📅 Patient Age",
+                min_value=0,
+                max_value=120,
+                step=1,
+                key="liver_age",
+            )
+            direct_bilirubin = st.number_input(
+                "🧪 Direct Bilirubin",
+                min_value=0.0,
+                max_value=20.0,
+                step=0.1,
+                key="direct_bilirubin",
+            )
         with col2:
-            total_bilirubin = st.number_input("⚗️ Total Bilirubin", 0.0, 50.0, 1.0)
-            albumin = st.number_input("🧬 Albumin Level", 1.0, 6.0, 3.0)
+            total_bilirubin = st.number_input(
+                "⚗️ Total Bilirubin",
+                min_value=0.0,
+                max_value=50.0,
+                step=0.1,
+                key="total_bilirubin",
+            )
+            albumin = st.number_input(
+                "🧬 Albumin Level",
+                min_value=1.0,
+                max_value=6.0,
+                step=0.1,
+                key="albumin",
+            )
 
         st.write("")
         if st.button("Analyze Liver Prediction"):
