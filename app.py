@@ -1,8 +1,10 @@
 import io
 import json
+import os
 from pathlib import Path
 import pickle
 import re
+import sys
 import time
 
 import streamlit as st
@@ -19,8 +21,8 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-GOOGLE_API_KEY = "YOUR_GOOGLE_API_KEY_HERE"
-GEMINI_VISION_MODEL = "gemini-1.5-flash"
+GOOGLE_API_KEY = "AIzaSyCWSbsUDQ5S9NlvAo8s_4mEgxKBvbM0JK4"
+GEMINI_VISION_MODEL = "models/gemini-2.5-flash"
 
 SESSION_DEFAULTS = {
     "diabetes_pregnancies": 0,
@@ -105,16 +107,60 @@ def normalize_report_values(payload):
     }
 
 
-def extract_report_values(image_bytes):
-    if genai is None or Image is None:
-        raise RuntimeError("Install google-generativeai and pillow to use report upload.")
+def get_gemini_module():
+    global genai
 
+    if genai is None:
+        try:
+            import google.generativeai as genai_module
+            genai = genai_module
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Install google-generativeai to use Gemini features. Current interpreter: {sys.executable}"
+            ) from exc
+
+    return genai
+
+
+def get_gemini_model(model_name):
     if GOOGLE_API_KEY == "YOUR_GOOGLE_API_KEY_HERE":
         raise RuntimeError("Add your GOOGLE_API_KEY in the GOOGLE_API_KEY placeholder first.")
 
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel(GEMINI_VISION_MODEL)
-    image = Image.open(io.BytesIO(image_bytes))
+    clear_dead_local_proxy()
+    gemini = get_gemini_module()
+    gemini.configure(api_key=GOOGLE_API_KEY)
+    return gemini.GenerativeModel(model_name)
+
+
+def clear_dead_local_proxy():
+    dead_proxy = "http://127.0.0.1:9"
+    proxy_keys = (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    )
+
+    for key in proxy_keys:
+        if os.environ.get(key) == dead_proxy:
+            os.environ.pop(key, None)
+
+
+def extract_report_values(image_bytes):
+    if Image is None:
+        try:
+            from PIL import Image as pil_image
+            Image = pil_image
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Install pillow to use report upload. Current interpreter: {sys.executable}"
+            ) from exc
+
+    model = get_gemini_model(GEMINI_VISION_MODEL)
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image.thumbnail((1400, 1400))
 
     prompt = """
     You are reading a blood test or medical report image.
@@ -137,10 +183,19 @@ def extract_report_values(image_bytes):
     - Do not add any extra keys or explanation.
     """
 
-    response = model.generate_content(
-        [prompt, image],
-        generation_config={"temperature": 0},
-    )
+    try:
+        response = model.generate_content(
+            [prompt, image],
+            generation_config={"temperature": 0},
+            request_options={"timeout": 30},
+        )
+    except Exception as exc:
+        error_text = str(exc).lower()
+        if "quota" in error_text or "429" in error_text or "resource_exhausted" in error_text:
+            raise RuntimeError("Gemini API quota exceeded. Please wait a minute and try again.") from exc
+        if "timeout" in error_text or "deadline" in error_text:
+            raise RuntimeError("Gemini request timed out. Upload a smaller, clearer image and try again.") from exc
+        raise RuntimeError(f"Gemini extraction failed: {exc}") from exc
 
     raw_text = getattr(response, "text", "") or ""
     return normalize_report_values(extract_json_from_text(raw_text))
@@ -402,6 +457,74 @@ st.markdown(
         flex-shrink: 0;
     }
 
+    .report-preview-shell {
+        margin-top: 0.8rem;
+        padding: 0.9rem 0.95rem 0.75rem;
+        background: linear-gradient(135deg, rgba(10, 24, 38, 0.78) 0%, rgba(17, 41, 63, 0.58) 100%);
+        border: 1px solid rgba(255, 255, 255, 0.10);
+        border-radius: 18px;
+        box-shadow: 0 14px 28px rgba(5, 16, 27, 0.18);
+        backdrop-filter: blur(16px);
+    }
+
+    .report-preview-kicker {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        padding: 0.28rem 0.62rem;
+        border-radius: 999px;
+        background: rgba(79, 156, 249, 0.12);
+        border: 1px solid rgba(79, 156, 249, 0.22);
+        color: #dff0ff;
+        font-size: 0.72rem;
+        letter-spacing: 0.07em;
+        text-transform: uppercase;
+    }
+
+    .report-preview-title {
+        margin: 0.7rem 0 0.2rem;
+        font-size: 0.95rem;
+        font-weight: 700;
+        color: #eef7ff;
+    }
+
+    .report-preview-note {
+        margin: 0;
+        font-size: 0.78rem;
+        line-height: 1.5;
+        color: #c4d6e8;
+    }
+
+    [data-testid="stSidebar"] [data-testid="stExpander"] {
+        margin-top: 0.55rem;
+    }
+
+    [data-testid="stSidebar"] [data-testid="stExpander"] details {
+        background: rgba(255, 255, 255, 0.045);
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        border-radius: 18px;
+        overflow: hidden;
+        box-shadow: 0 14px 26px rgba(5, 16, 27, 0.16);
+    }
+
+    [data-testid="stSidebar"] [data-testid="stExpander"] summary {
+        background: linear-gradient(135deg, rgba(13, 31, 48, 0.92) 0%, rgba(19, 47, 74, 0.64) 100%);
+        border-radius: 18px;
+        padding: 0.28rem 0.4rem;
+    }
+
+    [data-testid="stSidebar"] [data-testid="stExpander"] summary:hover {
+        background: linear-gradient(135deg, rgba(16, 36, 56, 0.98) 0%, rgba(24, 54, 84, 0.72) 100%);
+    }
+
+    [data-testid="stSidebar"] [data-testid="stExpander"] details[open] {
+        border-color: rgba(79, 156, 249, 0.18);
+    }
+
+    [data-testid="stSidebar"] [data-testid="stExpander"] label p {
+        font-size: 0.8rem;
+    }
+
     .module-diagrams {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -546,6 +669,12 @@ st.markdown(
         backdrop-filter: blur(14px);
     }
 
+    [data-testid="stImage"] img {
+        border-radius: 18px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 16px 30px rgba(5, 16, 27, 0.22);
+    }
+
     hr {
         border-color: rgba(255, 255, 255, 0.10);
     }
@@ -637,19 +766,47 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Upload Report & Auto-Fill")
-    uploaded_report = st.file_uploader(
-        "Upload Blood Test Report",
-        type=["jpg", "jpeg", "png"],
-        key="report_uploader",
-    )
+    with st.expander("＋ Add Report Source", expanded=False):
+        uploaded_report = st.file_uploader(
+            "Choose Report From Files",
+            type=["jpg", "jpeg", "png"],
+            key="report_uploader",
+        )
+        camera_report = st.camera_input(
+            "Capture Report With Mobile Camera",
+            key="camera_report_input",
+        )
+        st.caption("Use files, gallery images, recent photos, or a fresh mobile capture from one place.")
+    selected_report = camera_report if camera_report is not None else uploaded_report
+    selected_source = "Mobile Camera" if camera_report is not None else "Gallery Upload"
+
+    if selected_report is not None:
+        st.markdown(
+            f"""
+            <div class="report-preview-shell">
+                <div class="report-preview-kicker">Selected Source • {selected_source}</div>
+                <div class="report-preview-title">Report Preview</div>
+                <p class="report-preview-note">Keep the report flat, crop extra background, and make sure the lab values are clearly visible for faster extraction.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.image(
+            selected_report.getvalue(),
+            caption=f"Preview • {selected_source}",
+            use_container_width=True,
+        )
 
     if st.button("Extract Values From Report", key="extract_report_values_button"):
-        if uploaded_report is None:
-            st.warning("Please upload a JPG or PNG blood test report first.")
+        report_file = selected_report
+        report_source = "mobile camera" if camera_report is not None else "uploaded image"
+
+        if report_file is None:
+            st.warning("Please upload a report image or capture one from your mobile camera first.")
         else:
             try:
-                with st.spinner("Reading report with Gemini Vision..."):
-                    extracted_values = extract_report_values(uploaded_report.getvalue())
+                with st.spinner(f"Reading {report_source} with Gemini Vision..."):
+                    extracted_values = extract_report_values(report_file.getvalue())
                 st.session_state["extracted_report_values"] = extracted_values
                 st.success("Report values extracted successfully.")
             except Exception as exc:
