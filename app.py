@@ -21,7 +21,7 @@ except ImportError:
 
 
 BASE_DIR = Path(__file__).resolve().parent
-GOOGLE_API_KEY = "AIzaSyCWSbsUDQ5S9NlvAo8s_4mEgxKBvbM0JK4"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GEMINI_VISION_MODEL = "models/gemini-2.5-flash"
 
 SESSION_DEFAULTS = {
